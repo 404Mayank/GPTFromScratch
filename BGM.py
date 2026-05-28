@@ -2,17 +2,22 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as f
 
-n_embed = 32
+n_embed = 384
 max_new_tokens = 500
 split_ratio = 0.9
 batch_size = 64
-block_size = 8
-epoches = 10000
-learning_rate = 1e-3
-eval_iters = 300
+block_size = 256
+epoches = 5000
+learning_rate = 1e-4
+eval_iters = 200
 eval_interval = 500
-head_count = 4
+head_count = 6
+blocks_count = 6
+dropout = 0.2
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+torch.autograd.set_detect_anomaly(True, check_nan=False)
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 input = "input.txt"
@@ -51,13 +56,30 @@ def get_batch(split):
     return x, y
 
 
+class Block(nn.Module):
+    def __init__(self, n_embed, head_count):
+        super().__init__()
+        self.sa_heads = MultiHeadAttention(head_count, n_embed // head_count)
+        self.ffwd = FeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x):
+        x = x + self.sa_heads(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
 class FeedForward(nn.Module):
     def __init__(self, n_embed):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embed, n_embed),
+            nn.Linear(n_embed, 4 * n_embed),
             nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout)
         )
+        
 
     def forward(self, x):
         return self.net(x)
@@ -70,6 +92,7 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embed, head_size)
         self.query = nn.Linear(n_embed, head_size)
         self.value = nn.Linear(n_embed, head_size)
+        self.dropout = nn.Dropout(dropout)
         self.tril: torch.Tensor
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
@@ -85,6 +108,7 @@ class Head(nn.Module):
             self.tril[:T, :T] == 0, float("-inf")
         )  # masks the irrelevent token sequences usnig a triangular matrix and sets to -inf
         wei = f.softmax(wei, dim=-1)  # normalizes to 0->1
+        wei = self.dropout(wei)
         v = self.value(x)  # get values (B, T, head_size)
         out = wei @ v  # (B, T, T) @ (B, T, C) >> (T,T) @ (T,C) = (T,C)
         # we get Token and thier distributed values according to weight matrix
@@ -96,10 +120,14 @@ class Head(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, head_count, head_size):
         super().__init__()
+        self.proj = nn.Linear(n_embed, n_embed)
         self.heads = nn.ModuleList([Head(head_size) for _ in range(head_count)])
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return self.dropout(out)
 
 
 class BLM(nn.Module):
@@ -108,17 +136,17 @@ class BLM(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         # self.sa_head = Head(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
-        self.sa_heads = MultiHeadAttention(head_count, n_embed // 4)
+        self.ln_f = nn.LayerNorm(n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, head_count) for _ in range (blocks_count)])
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.ffwd = FeedForward(n_embed)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
-        x = self.sa_heads(x)
-        x = self.ffwd(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
         logits = self.lm_head(x)
 
         if targets is None:
